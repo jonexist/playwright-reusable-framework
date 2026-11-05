@@ -1,0 +1,49 @@
+name: Setup E2E Node
+description: Install Node dependencies, restore caches, and install Playwright Chromium
+
+inputs:
+  install-playwright:
+    description: Whether to install Playwright browsers
+    required: false
+    default: "true"
+
+runs:
+  using: composite
+  steps:
+    - name: Setup Node.js
+      uses: actions/setup-node@v4
+      with:
+        node-version: 20
+        cache: yarn
+
+    - name: Restore Next.js cache
+      uses: actions/cache@v4
+      id: nextjs-cache
+      with:
+        path: .next/cache
+        key: nextjs-${{ runner.os }}-${{ hashFiles('yarn.lock') }}-${{ hashFiles('src/**', 'next.config.ts', 'tsconfig.json') }}
+        restore-keys: |
+          nextjs-${{ runner.os }}-${{ hashFiles('yarn.lock') }}-
+          nextjs-${{ runner.os }}-
+
+    - name: Restore Playwright browsers cache
+      if: inputs.install-playwright == 'true'
+      uses: actions/cache@v4
+      id: playwright-cache
+      with:
+        path: ~/.cache/ms-playwright
+        key: playwright-${{ runner.os }}-${{ hashFiles('yarn.lock') }}
+
+    - name: Install dependencies
+      shell: bash
+      run: yarn install --frozen-lockfile
+
+    - name: Install Playwright Chromium
+      if: inputs.install-playwright == 'true'
+      shell: bash
+      run: |
+        if [ "${{ steps.playwright-cache.outputs.cache-hit }}" = "true" ]; then
+          yarn playwright install chromium
+        else
+          yarn playwright install chromium --with-deps
+        fi

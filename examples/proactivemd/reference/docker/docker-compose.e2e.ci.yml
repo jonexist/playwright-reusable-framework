@@ -1,0 +1,77 @@
+# Ephemeral backend stack for Playwright CI (Postgres + Redis + API).
+# Run from pmd-platform-ui repo root:
+#   docker compose -f qa-automation/docker-compose.e2e.ci.yml up -d --wait
+#
+# Requires pmd-data-platform-backend checked out at ../pmd-data-platform-backend
+# (GitHub Actions: actions/checkout with path: pmd-data-platform-backend).
+
+services:
+  db:
+    image: postgres:16
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: admin
+      POSTGRES_DB: postgres
+    volumes:
+      - ./docker/postgres-init.sql:/docker-entrypoint-initdb.d/01-init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  api:
+    image: pmd-e2e-api:ci
+    build:
+      context: ../pmd-data-platform-backend
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      ENVIRONMENT: local
+      DEBUG: "True"
+      SECRET_KEY: ci-e2e-only
+      ALLOWED_HOSTS: localhost,127.0.0.1,api
+      DB_ENGINE: django.db.backends.postgresql
+      DB_NAME: pmd_local
+      DB_USER: postgres
+      DB_PASSWORD: admin
+      DB_HOST: db
+      DB_PORT: "5432"
+      DB_NAME_TUVA: tuva_db
+      DB_USER_TUVA: postgres
+      DB_PASSWORD_TUVA: admin
+      DB_HOST_TUVA: db
+      DB_PORT_TUVA: "5432"
+      CELERY_BROKER_URL: redis://redis:6379/0
+      REDIS_CACHE_URL: redis://redis:6379/1
+      REDIS_CHANNELS_URL: redis://redis:6379/2
+      RUN_CELERY_TASKS_SYNC: "True"
+      EMAIL_BACKEND: django.core.mail.backends.console.EmailBackend
+      FRONTEND_URL: http://localhost:3000
+      CORS_ALLOWED_ORIGINS: http://localhost:3000
+      TURNSTILE_SECRET_KEY: "1x0000000000000000000000000000000AA"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          'python -c "import urllib.request; urllib.request.urlopen(''http://localhost:8000/health/ready/'')" || exit 1',
+        ]
+      interval: 10s
+      timeout: 10s
+      retries: 18
+      start_period: 120s

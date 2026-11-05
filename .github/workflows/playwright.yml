@@ -1,0 +1,150 @@
+name: Playwright Automation
+
+# Runs the suite on PRs that are Ready for Review and not exempted by label.
+# Drafts and PRs labelled `skipped-playwright` get a passing `playwright`
+# check from the skip job below so branch protection is never blocked.
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    branches: [main, master, develop]
+  workflow_dispatch:
+
+concurrency:
+  group: playwright-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  typecheck:
+    name: typecheck
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+      !contains(github.event.pull_request.labels.*.name, 'skipped-playwright'))
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node + dependencies
+        uses: ./.github/actions/setup-e2e-node
+        with:
+          install-playwright: "false"
+
+      - run: npm run typecheck
+
+  playwright:
+    name: playwright
+    if: >
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.draft == false &&
+      !contains(github.event.pull_request.labels.*.name, 'skipped-playwright'))
+    needs: [typecheck]
+    # Keep above the globalTimeout in playwright.config.ts (50 min) + startup.
+    timeout-minutes: 65
+    runs-on: ubuntu-latest
+    outputs:
+      has_flaky: ${{ steps.flaky.outputs.found }}
+
+    env:
+      CI: "true"
+      # The bundled demo app is started by Playwright's `webServer`.
+      # For a real app: set START_DEMO_APP=false and use the isolated-stack
+      # template in templates/workflows/playwright-isolated-stack.yml.
+      BASE_URL: http://localhost:4173
+      # Demo-only credentials (the demo app is an ephemeral in-memory server).
+      # For a real app these MUST come from repo secrets.
+      TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL || 'admin@example.com' }}
+      TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD || 'demo-admin-password' }}
+      TEST_RESTRICTED_USER_EMAIL: viewer@example.com
+      TEST_RESTRICTED_USER_PASSWORD: demo-viewer-password
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node + dependencies + Playwright browsers
+        uses: ./.github/actions/setup-e2e-node
+
+      - name: Run Playwright tests
+        run: npm run test:ci
+
+      - name: Detect flaky tests
+        id: flaky
+        if: always() && !cancelled()
+        run: |
+          FOUND=false
+          COUNT=0
+          if [ -f reports/json/results.json ]; then
+            COUNT=$(node -e "const r=require('./reports/json/results.json'); process.stdout.write(String(r.stats?.flaky ?? 0))")
+          fi
+          if [ "$COUNT" -gt 0 ]; then
+            FOUND=true
+            echo "Detected $COUNT flaky test(s)"
+          fi
+          echo "found=$FOUND" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      # Reports are only worth storing when someone needs to debug.
+      - name: Upload HTML report
+        if: failure() || steps.flaky.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-html-report
+          path: reports/html
+          retention-days: 7
+          if-no-files-found: ignore
+
+      - name: Upload traces, screenshots and videos
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-test-results
+          path: test-results
+          retention-days: 7
+          if-no-files-found: ignore
+
+  # Green runs leave nothing behind (artifact quota is shared org-wide).
+  cleanup-artifacts:
+    name: cleanup-artifacts
+    needs: [typecheck, playwright]
+    if: >
+      always() &&
+      needs.typecheck.result == 'success' &&
+      needs.playwright.result == 'success' &&
+      needs.playwright.outputs.has_flaky != 'true' &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete artifacts from this workflow run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const res = await github.rest.actions.listWorkflowRunArtifacts({
+              owner, repo, run_id: context.runId, per_page: 100,
+            });
+            for (const artifact of res.data.artifacts) {
+              core.info(`Deleting artifact ${artifact.name} (id ${artifact.id})`);
+              await github.rest.actions.deleteArtifact({
+                owner, repo, artifact_id: artifact.id,
+              });
+            }
+
+  playwright-skipped:
+    name: playwright
+    if: >
+      github.event_name == 'pull_request' &&
+      (github.event.pull_request.draft == true ||
+      contains(github.event.pull_request.labels.*.name, 'skipped-playwright'))
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Playwright skipped: PR is a draft or has the skipped-playwright label."

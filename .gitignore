@@ -1,0 +1,22 @@
+# Dependencies
+node_modules/
+
+# Playwright output
+/test-results/
+/playwright-report/
+/blob-report/
+/reports/
+/playwright/.cache/
+/playwright/.auth/
+
+# Secrets and generated session state (never commit)
+.env
+.env.*
+!.env.example
+/auth/*.storage-state.json
+/.cache/
+
+# OS / editor
+.DS_Store
+Thumbs.db
+*.tsbuildinfo

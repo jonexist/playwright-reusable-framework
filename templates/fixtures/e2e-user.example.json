@@ -1,0 +1,6 @@
+{
+  "email": "e2e-user@example.com",
+  "password": "REPLACE-ME-THROWAWAY-CI-PASSWORD",
+  "firstName": "Playwright",
+  "lastName": "E2E"
+}

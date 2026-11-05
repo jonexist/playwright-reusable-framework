@@ -1,0 +1,2 @@
+CREATE DATABASE pmd_local;
+CREATE DATABASE tuva_db;

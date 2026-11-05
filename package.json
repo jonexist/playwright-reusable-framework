@@ -1,0 +1,38 @@
+{
+  "name": "playwright-reusable-framework",
+  "version": "1.0.0",
+  "description": "Reusable Playwright QA automation framework (POM, fixtures, project dependency chain, isolated-stack CI) extracted from the ProactiveMD implementation.",
+  "private": true,
+  "license": "ISC",
+  "type": "commonjs",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "demo:start": "node demo-app/server.js",
+    "test": "playwright test",
+    "test:ci": "playwright test",
+    "test:unit": "playwright test --project=unit",
+    "test:api": "playwright test --project=api",
+    "test:ui": "playwright test --project=ui-chromium",
+    "test:e2e": "playwright test --project=e2e-auth",
+    "test:e2e:setup": "playwright test --project=e2e-setup-context",
+    "test:e2e:modules": "playwright test --project=e2e-modules",
+    "test:e2e:serial": "playwright test --project=e2e-serial",
+    "test:e2e:rbac": "playwright test --project=e2e-rbac",
+    "test:headed": "playwright test --headed",
+    "test:debug": "playwright test --debug",
+    "test:codegen": "playwright codegen",
+    "test:report": "playwright show-report reports/html",
+    "typecheck": "tsc --noEmit",
+    "browsers:install": "playwright install --with-deps chromium"
+  },
+  "devDependencies": {
+    "@faker-js/faker": "^10.6.0",
+    "@playwright/test": "^1.64.1",
+    "@types/node": "^26.6.6",
+    "dotenv": "^17.4.2",
+    "typescript": "^5.9.3",
+    "zod": "^4.6.7"
+  }
+}

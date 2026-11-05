@@ -1,0 +1,216 @@
+name: Playwright Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    branches: [develop]
+
+concurrency:
+  group: playwright-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  E2E_API_IMAGE: pmd-e2e-api:ci
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  typecheck:
+    name: typecheck
+    if: >
+      github.event.pull_request.draft == false &&
+      !contains(github.event.pull_request.labels.*.name, 'skipped-playwright')
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout UI repository
+        uses: actions/checkout@v4
+
+      - name: Setup E2E Node environment
+        uses: ./.github/actions/setup-e2e-node
+        with:
+          install-playwright: false
+
+      - name: Typecheck
+        run: yarn typecheck
+
+  playwright:
+    name: playwright
+    if: >
+      github.event.pull_request.draft == false &&
+      !contains(github.event.pull_request.labels.*.name, 'skipped-playwright')
+    needs: [typecheck]
+    # Keep above playwright.config.ts globalTimeout (50 min) + build/stack startup.
+    timeout-minutes: 75
+    runs-on: ubuntu-latest
+    outputs:
+      has_flaky: ${{ steps.flaky.outputs.found }}
+
+    env:
+      CI: true
+      APP_NAME: ${{ vars.APP_NAME || 'PMD-PLATFORM-UI' }}
+      BASE_URL: http://localhost:3000
+      API_BASE_URL: http://localhost:8000
+      RUN_EXAMPLE_TESTS: "false"
+      TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+      TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+      NEXT_PUBLIC_API_URL: http://localhost:8000
+      SESSION_SECRET: ${{ secrets.SESSION_SECRET }}
+      NEXT_PUBLIC_TURNSTILE_SITE_KEY: ${{ secrets.NEXT_PUBLIC_TURNSTILE_SITE_KEY }}
+
+    steps:
+      - name: Checkout UI repository
+        uses: actions/checkout@v4
+
+      - name: Checkout backend repository
+        uses: actions/checkout@v4
+        with:
+          repository: Wellness-For-Life/pmd-data-platform-backend
+          ref: master
+          path: pmd-data-platform-backend
+          token: ${{ secrets.BACKEND_REPO_PAT }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Setup E2E Node environment
+        uses: ./.github/actions/setup-e2e-node
+
+      - name: Build backend image and frontend in parallel
+        run: |
+          set +e
+
+          docker buildx build \
+            --file pmd-data-platform-backend/Dockerfile \
+            --tag "${{ env.E2E_API_IMAGE }}" \
+            --load \
+            --cache-from type=gha,scope=e2e-api-develop \
+            --cache-to type=gha,mode=min,scope=e2e-api-develop \
+            pmd-data-platform-backend &
+          docker_pid=$!
+
+          yarn build
+          yarn_build_status=$?
+
+          wait "$docker_pid"
+          docker_status=$?
+
+          set -e
+
+          if [ "$yarn_build_status" -ne 0 ]; then
+            kill "$docker_pid" 2>/dev/null || true
+            exit "$yarn_build_status"
+          fi
+          if [ "$docker_status" -ne 0 ]; then
+            exit "$docker_status"
+          fi
+
+      - name: Start E2E backend stack
+        run: docker compose -f qa-automation/docker-compose.e2e.ci.yml up -d --no-build --wait
+
+      - name: Seed E2E test user
+        run: |
+          docker compose -f qa-automation/docker-compose.e2e.ci.yml cp \
+            qa-automation/src/fixtures/e2e-user.json api:/tmp/e2e-user.json
+          docker compose -f qa-automation/docker-compose.e2e.ci.yml exec -T api \
+            python manage.py shell < qa-automation/src/scripts/seed-e2e-user.py
+
+      # Credentials live in the committed fixture (isolated CI stack only),
+      # so no extra repo secrets are needed for the RBAC specs.
+      - name: Seed E2E restricted (RBAC) user
+        run: |
+          docker compose -f qa-automation/docker-compose.e2e.ci.yml cp \
+            qa-automation/src/fixtures/e2e-restricted-user.json api:/tmp/e2e-restricted-user.json
+          docker compose -f qa-automation/docker-compose.e2e.ci.yml exec -T api \
+            python manage.py shell < qa-automation/src/scripts/seed-e2e-restricted-user.py
+          echo "TEST_RESTRICTED_USER_EMAIL=$(jq -r .email qa-automation/src/fixtures/e2e-restricted-user.json)" >> "$GITHUB_ENV"
+          echo "TEST_RESTRICTED_USER_PASSWORD=$(jq -r .password qa-automation/src/fixtures/e2e-restricted-user.json)" >> "$GITHUB_ENV"
+
+      - name: Start Frontend
+        run: |
+          yarn start &
+          yarn wait-on http://localhost:3000 -t 120000
+
+      - name: Run Playwright tests
+        run: yarn test:playwright:ci
+
+      - name: Detect flaky tests
+        id: flaky
+        if: always() && !cancelled()
+        run: |
+          FOUND=false
+          COUNT=0
+          if [ -f reports/json/results.json ]; then
+            COUNT=$(node -e "const r=require('./reports/json/results.json'); process.stdout.write(String(r.stats?.flaky ?? 0))")
+          fi
+          if [ "$COUNT" -gt 0 ]; then
+            FOUND=true
+            echo "Detected $COUNT flaky test(s)"
+          fi
+          echo "found=$FOUND" >> "$GITHUB_OUTPUT"
+          echo "count=$COUNT" >> "$GITHUB_OUTPUT"
+
+      - name: Stop E2E backend stack
+        if: always()
+        run: docker compose -f qa-automation/docker-compose.e2e.ci.yml down -v
+
+      - name: Upload HTML report
+        if: failure() || steps.flaky.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-html-report
+          path: reports/html
+          retention-days: 7
+          if-no-files-found: ignore
+
+  cleanup-artifacts:
+    name: cleanup-artifacts
+    needs: [typecheck, playwright]
+    if: >
+      always() &&
+      needs.typecheck.result == 'success' &&
+      needs.playwright.result == 'success' &&
+      needs.playwright.outputs.has_flaky != 'true' &&
+      (
+        github.event_name != 'pull_request' ||
+        github.event.pull_request.head.repo.full_name == github.repository
+      )
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - name: Delete artifacts from this workflow run
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const runId = context.runId;
+            const res = await github.rest.actions.listWorkflowRunArtifacts({
+              owner,
+              repo,
+              run_id: runId,
+              per_page: 100,
+            });
+            for (const artifact of res.data.artifacts) {
+              core.info(`Deleting artifact ${artifact.name} (id ${artifact.id})`);
+              await github.rest.actions.deleteArtifact({
+                owner,
+                repo,
+                artifact_id: artifact.id,
+              });
+            }
+
+  playwright-skipped:
+    name: playwright
+    if: >
+      github.event.pull_request.draft == true ||
+      contains(github.event.pull_request.labels.*.name, 'skipped-playwright')
+    runs-on: ubuntu-latest
+    steps:
+      - name: Playwright skipped
+        run: |
+          echo "Playwright skipped: PR is draft or has skipped-playwright label."

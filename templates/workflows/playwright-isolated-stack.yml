@@ -1,0 +1,186 @@
+# TEMPLATE — isolated-stack E2E on GitHub Actions.
+#
+# Copy to .github/workflows/playwright.yml and replace every <PLACEHOLDER>.
+# Generalised from the ProactiveMD pipeline (see examples/proactivemd/ci/).
+#
+# What it does, on ONE runner (no workflow artifacts between jobs):
+#   typecheck -> [build backend image || build frontend] -> compose up -> seed
+#   -> start frontend -> run Playwright -> compose down -> report on failure
+#
+# Why isolated: tests that create/modify data must not hit a shared
+# environment. A fresh database per run removes flakiness from other users'
+# data, staging downtime and long-lived test accounts.
+#
+# Required repo secrets (Settings > Secrets and variables > Actions):
+#   BACKEND_REPO_PAT   read access to the private backend repo (skip if same repo)
+#   TEST_USER_EMAIL    must equal the email in your seed fixture
+#   TEST_USER_PASSWORD must equal the password in your seed fixture
+#   <FRONTEND_BUILD_SECRET>  e.g. a session secret needed by `npm run build`
+
+name: Playwright Automation
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review, labeled, unlabeled]
+    branches: [<TARGET_BRANCH>]
+
+concurrency:
+  group: playwright-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  actions: write
+
+env:
+  E2E_API_IMAGE: e2e-api:ci
+  COMPOSE_FILE: docker/docker-compose.e2e.ci.yml
+
+jobs:
+  typecheck:
+    name: typecheck
+    if: >
+      github.event.pull_request.draft == false &&
+      !contains(github.event.pull_request.labels.*.name, 'skipped-playwright')
+    timeout-minutes: 10
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/setup-e2e-node
+        with:
+          install-playwright: "false"
+      - run: npm run typecheck
+
+  playwright:
+    name: playwright
+    if: >
+      github.event.pull_request.draft == false &&
+      !contains(github.event.pull_request.labels.*.name, 'skipped-playwright')
+    needs: [typecheck]
+    # Keep above the Playwright globalTimeout (50 min) + build/stack startup.
+    timeout-minutes: 75
+    runs-on: ubuntu-latest
+    outputs:
+      has_flaky: ${{ steps.flaky.outputs.found }}
+
+    env:
+      CI: "true"
+      BASE_URL: http://localhost:3000
+      API_BASE_URL: http://localhost:8000
+      START_DEMO_APP: "false"            # use the real stack, not the demo app
+      TEST_USER_EMAIL: ${{ secrets.TEST_USER_EMAIL }}
+      TEST_USER_PASSWORD: ${{ secrets.TEST_USER_PASSWORD }}
+      # Baked into the frontend at build time — must be the CI API URL.
+      NEXT_PUBLIC_API_URL: http://localhost:8000   # adjust for your framework
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Drop this step if the backend lives in the same repo.
+      - name: Checkout backend repository
+        uses: actions/checkout@v4
+        with:
+          repository: <ORG>/<BACKEND_REPO>
+          ref: <BACKEND_BRANCH>
+          path: backend
+          token: ${{ secrets.BACKEND_REPO_PAT }}
+
+      - uses: docker/setup-buildx-action@v3
+
+      - uses: ./.github/actions/setup-e2e-node
+
+      # Build both in parallel. Scope + mode=min keep the GHA cache from
+      # exploding per PR. NEVER upload the image or build output as artifacts.
+      - name: Build backend image and frontend in parallel
+        run: |
+          set +e
+          docker buildx build \
+            --file backend/Dockerfile --tag "$E2E_API_IMAGE" --load \
+            --cache-from type=gha,scope=e2e-api \
+            --cache-to type=gha,mode=min,scope=e2e-api \
+            backend &
+          docker_pid=$!
+
+          npm run build
+          build_status=$?
+
+          wait "$docker_pid"
+          docker_status=$?
+          set -e
+
+          if [ "$build_status" -ne 0 ]; then kill "$docker_pid" 2>/dev/null || true; exit "$build_status"; fi
+          if [ "$docker_status" -ne 0 ]; then exit "$docker_status"; fi
+
+      - name: Start E2E backend stack
+        run: docker compose -f "$COMPOSE_FILE" up -d --no-build --wait
+
+      # QA-owned seeding: lives in THIS repo, so QA needs no backend write access.
+      - name: Seed E2E test user
+        run: |
+          docker compose -f "$COMPOSE_FILE" cp fixtures/e2e-user.json api:/tmp/e2e-user.json
+          docker compose -f "$COMPOSE_FILE" exec -T api \
+            python manage.py shell < docker/seed/seed-django-user.py
+
+      - name: Start frontend
+        run: |
+          npm run start &
+          npx wait-on "$BASE_URL" -t 120000
+
+      - name: Run Playwright tests
+        run: npm run test:ci
+
+      - name: Detect flaky tests
+        id: flaky
+        if: always() && !cancelled()
+        run: |
+          FOUND=false; COUNT=0
+          if [ -f reports/json/results.json ]; then
+            COUNT=$(node -e "const r=require('./reports/json/results.json'); process.stdout.write(String(r.stats?.flaky ?? 0))")
+          fi
+          if [ "$COUNT" -gt 0 ]; then FOUND=true; fi
+          echo "found=$FOUND" >> "$GITHUB_OUTPUT"
+
+      - name: Stop E2E backend stack
+        if: always()
+        run: docker compose -f "$COMPOSE_FILE" down -v
+
+      - name: Upload HTML report
+        if: failure() || steps.flaky.outputs.found == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-html-report
+          path: reports/html
+          retention-days: 7
+          if-no-files-found: ignore
+
+  cleanup-artifacts:
+    name: cleanup-artifacts
+    needs: [typecheck, playwright]
+    if: >
+      always() && needs.typecheck.result == 'success' &&
+      needs.playwright.result == 'success' &&
+      needs.playwright.outputs.has_flaky != 'true'
+    timeout-minutes: 5
+    runs-on: ubuntu-latest
+    permissions:
+      actions: write
+    steps:
+      - uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const res = await github.rest.actions.listWorkflowRunArtifacts({
+              owner, repo, run_id: context.runId, per_page: 100,
+            });
+            for (const a of res.data.artifacts) {
+              await github.rest.actions.deleteArtifact({ owner, repo, artifact_id: a.id });
+            }
+
+  playwright-skipped:
+    name: playwright
+    if: >
+      github.event.pull_request.draft == true ||
+      contains(github.event.pull_request.labels.*.name, 'skipped-playwright')
+    runs-on: ubuntu-latest
+    steps:
+      - run: echo "Playwright skipped (draft PR or skipped-playwright label)."
